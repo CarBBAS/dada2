@@ -1,0 +1,833 @@
+---
+title: "DADA2 workflow"
+author: "Masumi Stadler"
+date: "December 2018"
+output: 
+  html_notebook:
+    theme: united
+    toc: yes
+  html_document:
+    toc: yes
+---
+
+```{r "setup", include=FALSE}
+require("knitr")
+opts_knit$set(root.dir = "/home/bioinf/data/Bioinf.LaRomaine/")
+```
+
+---
+
+# Rename files from sequencing service
+
+Sometimes, file names from sequencing services have their own names with extensions that are unnecessary. In order to rename the files to a version that is usable for us in downstream processing, we do this through R.
+```{r}
+############
+# Packages #
+############
+library(dplyr)
+
+######################
+# Rename fastq files #
+######################
+
+filepath <- "/home/change/me/to/directory" # CHANGE ME
+```
+
+First, we will need to identify a repetitive pattern that appears in all your file so we can remove this and only remain the unique identifier for your samples.
+```{r}
+######################################################
+## Rename your files on your local directory from R ##
+######################################################
+
+# Find your files on your computer
+
+file.names <- dir(filepath, pattern = "*fastq.gz") # uncompressed files
+# this function splits your file name by an "_"
+# check which separator makes the most sense for your file names, you want to isolate your sample name
+
+# our example is the following: "MI.MO3992_0286.001.FLD0097.1_DNA_R1.fastq"
+# we want the final name to be: "1-DNA_R1.fastq"
+# 1 is the sample name
+# DNA because we have DNA and RNA samples
+# and keep the _R1.fastq or _R2.fastq
+
+t <- strsplit(file.names, ".", fixed = T)
+
+# see how your file name was split and locate the number of element you need
+t[[1]] # first sample in your folder
+
+# so we can keep element t[[i]][3] for the "DNA"
+# and element t[[i]][4] for the extension "_R1.fastq"
+```
+
+The next loop creates a new vector containing your new file names.
+**WARNING**: messing with file extensions/suffix can corrupt files (e.g. mixing "fastq.gz" and "fastq"), always try a subset (e.g. 10 files) first and also keep a copy of your non-renamed samples as safety.
+```{r}
+# to get the sample name/number, we again have to split but this time by "."
+# we incorporate this a the loop
+
+# before running the loop we have to create empty objects to store the new file names
+new.names <- vector()
+
+# Let's loop
+for(i in 1:length(t)){
+  # Now, we save them into empty vectors
+  new.names[i] <- paste0(t[[i]][5], ".", t[[i]][6], ".", t[[i]][7]) # combine strings to new file name
+}
+
+t <- strsplit(new.names, "_", fixed = T)
+
+for(i in 1:length(t)){
+  # Now, we save them into empty vectors
+  if(length(t[[i]]) == 3){
+    new.names[i] <- paste0(t[[i]][1], ".", t[[i]][2], "D_", t[[i]][3]) # combine strings to new file name
+  } else {
+    new.names[i] <- paste0(t[[i]][1], "D_", t[[i]][2]) # combine strings to new file name
+  }
+}
+
+# check if you have double "//" or anything else that might be mixed up
+# change your `filepath` object accordingly above
+
+paste0(filepath, file.names[1])
+paste0(filepath, new.names[1])
+```
+
+This loop actually renames your files. Remember always to try on a subset first!
+```{r}
+# Let's loop again
+################# RENAMING LOOP #################
+for(f in 1:length(file.names)){
+  file.rename(paste0(filepath, file.names[f]), paste0(filepath, new.names[f]))  
+}
+#################################################
+
+```
+
+---
+
+# Remove primers with *cutadapt*
+
+DADA2 can identify amplicon sequence variants (ASVs) by a single nucleotide difference. Thus, one of the key steps is to remove the primers cleanly. To do this, we will utilise the software `cutadapt`. Make sure to download the software beforehand. Follow the instructions [here](https://cutadapt.readthedocs.io/en/stable/installation.html).
+
+```{r}
+############
+# Packages #
+############
+library("dada2"); packageVersion("dada2")
+library("plyr"); library("dplyr")
+library("ShortRead"); packageVersion("ShortRead")
+library("Biostrings"); packageVersion("Biostrings")
+```
+
+We are following the [ITS tutorial](https://benjjneb.github.io/dada2/ITS_workflow.html) adapted to 16S rRNA primers. For finer instructions in case of issues, please refer to comments by the developer in the tutorial.
+
+---
+
+In our case, we have split the fastq files into separate folders by years. Working through lists can be avoided if all sample files are in one folder. I highly recommend unifying the files before starting with the pipeline, it makes coding easier and you will see that later, I decided to combine all files into one directory.
+Make sure to change also the `pattern =` argument if you have uncompressed files or `gz` files.
+```{r}
+##################
+# Remove primers #
+##################
+
+path <- list("/home/user/data/change/me/to/2015",
+             "/home/user/data/change/me/to/2016",
+             "/home/user/data/change/me/to/2017")
+## CHANGE ME to the directory containing the fastq files.
+# single-directory:
+# path <- "/home/user/data/change/me/to/directory"
+
+path.list <- lapply(path, list.files, pattern = "*fastq.gz")
+# single-directory:
+# list.files(path, pattern = "*fastq.gz")
+
+# create a new function to sort files according to their names
+sort.files <- function(x, pattern){
+  sort(list.files(x, pattern = pattern, full.names = TRUE))
+}
+
+# extract file names separately for forward and reverse reads
+fnFs <- lapply(path, sort.files, pattern = "_R1.fastq.gz")
+fnRs <- lapply(path, sort.files, pattern = "_R2.fastq.gz")
+# single-directory:
+# fnFs <- sort.files(path, pattern = "_R1.fastq.gz")
+# fnRs <- sort.files(path, pattern = "_R2.fastq.gz")
+
+```
+
+---
+
+## Identify primers
+
+Next, we will identify the unique sequence of the primer and identify the reverse complements of them.
+```{r}
+# identify unique sequence of used primer (Example: 16S rRNA 505F and 806R; V4 region)
+FWD <- "GTGCCAGCMGCCGCGGTAA"  ## CHANGE ME to your forward primer sequence
+REV <- "GGACTACHVGGGTWTCTAAT"  ## CHANGE ME to your reverse primer sequence
+
+# identify all potential orientations of primer
+allOrients <- function(primer) {
+  # Create all orientations of the input sequence
+  require(Biostrings)
+  dna <- DNAString(primer)  # The Biostrings works w/ DNAString objects rather than character vectors
+  orients <- c(Forward = dna, Complement = complement(dna), Reverse = reverse(dna), 
+               RevComp = reverseComplement(dna))
+  return(sapply(orients, toString))  # Convert back to character vector
+}
+
+FWD.orients <- allOrients(FWD)
+REV.orients <- allOrients(REV)
+FWD.orients
+```
+
+---
+
+## Filter ambiguous bases
+
+Next, we will only extract the sample names from the whole path. The presence of ambiguous bases (Ns) in the sequencing reads makes accurate mapping of short primer sequences difficult. Next we are going to “pre-filter” the sequences just to remove those with Ns, but perform no other filtering.
+```{r}
+# identify file names without full path
+# basename() takes the string after the last separator
+baseFs <- lapply(fnFs, basename)
+baseRs <- lapply(fnRs, basename)
+# single-directory:
+# baseFs <- basename(fnFs)
+# baseRs <- basename(fnRs)
+
+# create a "filtN" folder where all filtered read files are going to be stored
+# mapply() for multivariate objects as file.path and baseFs both are lists
+fnFs.filtN <- mapply(file.path, path, "filtN", baseFs) # Put N-filterd files in filtN/ subdirectory
+fnRs.filtN <- mapply(file.path, path, "filtN", baseRs)
+# single-directory:
+# fnFs.filtN <- file.path(path, "filtN", basename(fnFs))
+# fnRs.filtN <- file.path(path, "filtN", basename(fnRs))
+
+# actually filter and save reads
+mapply(filterAndTrim, fnFs, fnFs.filtN, fnRs, fnRs.filtN, maxN = 0, multithread = TRUE, compress = TRUE)
+# single-directory:
+# filterAndTrim(fnFs, fnFs.filtN, fnRs, fnRs.filtN, maxN = 0, multithread = TRUE)
+```
+
+We are now ready to count the number of times the primers appear in the forward and reverse read, while considering all possible primer orientations. Identifying and counting the primers on one set of paired end FASTQ files is sufficient, assuming all the files were created using the same library preparation, so we’ll just process the first sample.
+```{r}
+# how often does the primer or reverse complement appear in our reads?
+# we only inspect the first sample of each year
+primerHits <- function(primer, fn) {
+  # Counts number of reads in which the primer is found
+  nhits <- vcountPattern(primer, sread(readFastq(fn)), fixed = FALSE)
+  return(sum(nhits > 0))
+}
+
+ff <- sapply(fnFs.filtN, "[[", 1) # extracts the first element in filtN folder
+fr <- sapply(fnRs.filtN, "[[", 1)
+for(i in 1:3){
+  x <- rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = ff[i]),
+             FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = fr[i]), 
+             REV.ForwardReads = sapply(REV.orients, primerHits, fn = ff[i]), 
+             REV.ReverseReads = sapply(REV.orients, primerHits, fn = fr[i]))
+  print(x)
+}
+
+# single-directory:
+# rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs.filtN[[1]]), 
+#    FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = fnRs.filtN[[1]]), 
+#    REV.ForwardReads = sapply(REV.orients, primerHits, fn = fnFs.filtN[[1]]), 
+#    REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs.filtN[[1]]))
+```
+As expected, the FWD primer is found in the forward reads in its forward orientation, and in some of the reverse reads in its reverse-complement orientation (due to read-through when the ITS region is short). Similarly the REV primer is found with its expected orientations.
+
+*Note*: Orientation mixups are a common trip-up. If, for example, the REV primer is matching the Reverse reads in its RevComp orientation, then replace REV with its reverse-complement orientation (REV <- REV.orient[["RevComp"]]) before proceeding.
+
+---
+
+## Remove primers
+
+Now, we will remove the primer with `cutadapt`. For specific flags to adjust to your sequences refer to the softwares [documentation](https://cutadapt.readthedocs.io/en/stable/guide.html).
+```{r}
+# load cutadapt
+cutadapt <- "/home/user/.local/bin/cutadapt" # CHANGE ME to the cutadapt path on your machine
+system2(command = cutadapt, args = "--version") # Run shell commands from R
+
+# create folder cutadapt where the primer free sequences will be stored
+path.cut <- lapply(path, file.path, "cutadapt")
+lapply(path.cut, dir.create) # creates cutadapt folder
+
+# preparation for cutting the primer
+fnFs.cut <- mapply(file.path, path.cut, baseFs) # combine the path and the sample names for FWD
+fnRs.cut <- mapply(file.path, path.cut, baseRs) # same for REV
+
+# single-directory:
+# path.cut <- file.path(path, "cutadapt")
+# dir.create(path.cut)
+# fnFs.cut <- file.path(path.cut, basename(fnFs))
+# fnRs.cut <- file.path(path.cut, basename(fnRs))
+
+FWD.RC <- dada2:::rc(FWD) # extract seqeuence of reverse complement of FWD
+REV.RC <- dada2:::rc(REV) # extract seqeuence of reverse complement of REV
+
+# create strings for the arguments fed to cutadapt
+# Trim FWD and the reverse-complement of REV off of R1 (forward reads)
+R1.flags <- paste("-g",FWD,"-a",REV.RC, sep = " ") 
+# Trim REV and the reverse-complement of FWD off of R2 (reverse reads)
+R2.flags <- paste("-G",REV,"-A",FWD.RC, sep = " ") 
+# seems like the arg = argument of system2() needs the command arguments as elements of a vector
+# meaning, if we paste it together as below it wont work
+# I couldn't figure out how to make c() work with mapply so we do a work around
+# first, paste together all elements into a string with an unique pattern '#' in between for later splitting
+
+# -m argument is included as in 2015 samples, we have a lot of short reads
+# it removes all reads that are shorter than 125 bases, I chose 125 as the minimum bases needed
+# to have an overlap when merging paired-end reads is 127 for the V4 region of 16S rRNA
+
+# -j 0 is added to allow multithread processing
+# make sure to install pigz before if you work with compressed files
+
+cut.arg <- mapply(paste, R1.flags, R2.flags, "-n", "2", "-m", "125", "-j", "0", "-o", fnFs.cut, "-p", fnRs.cut, fnFs.filtN, fnRs.filtN, sep = "#")  #
+names(cut.arg) <- c("year1", "year2", "year3") # rename bin names for easier overview
+# then we split by # into elements to combine later into a vector for cutadapt 
+cut.arg <- mapply(strsplit, cut.arg, split = "[#]") # create nested list
+
+# to go through each file, we use two loops to access the bins inside bins
+# NOTE: cutadapt prints a lot of text including an Unicode error that is not problematic at all
+for(i in 1:length(cut.arg)){
+  for(j in 1:length(cut.arg[[i]])){
+    system2(cutadapt, args = c(unlist(cut.arg[[i]][[j]])))
+  }
+}
+
+# single-directory:
+#for(i in seq_along(fnFs)) {
+#  system2(cutadapt, args = c(R1.flags, R2.flags, "-n", 2,, "-m", 125, "-j", 0,
+#                             "-o", fnFs.cut[i], "-p", fnRs.cut[i], # output files
+#                             fnFs.filtN[i], fnRs.filtN[i])) # input files
+#}
+
+```
+
+Sanity check.
+```{r}
+# as a sanity check, we repeat the same excercise as above
+ff <- sapply(fnFs.cut, "[[", 1)
+fr <- sapply(fnRs.cut, "[[", 1)
+for(i in 1:3){
+  x <- rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = ff[i]),
+             FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = fr[i]), 
+             REV.ForwardReads = sapply(REV.orients, primerHits, fn = ff[i]), 
+             REV.ReverseReads = sapply(REV.orients, primerHits, fn = fr[i]))
+  print(x)
+}
+
+# All zeroes? You've removed the primers successfully!
+
+# single-directory:
+# rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs.cut[[1]]), 
+#    FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = fnRs.cut[[1]]), 
+#    REV.ForwardReads = sapply(REV.orients, primerHits, fn = fnFs.cut[[1]]), 
+#    REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs.cut[[1]]))
+
+```
+
+---
+
+# Clean files
+
+Our samples included not only various years but also DNA and cDNA and differing sequencing runs. It is advised to run DADA2 on a by plate manner to learn the errors and the sequence inference step. We will also pool samples by year and plate to retain more singletons. For this, we will clean some sample names and create a column in the end that we use to split the files along the process.
+
+```{r}
+############
+# Packages #
+############
+library("tidyverse")
+```
+
+We have folders with the corresponding years as directory names, we will loop through the names and extract the file name. All the above steps for separating the folders initially was indeed redundant, I started coding with split folders at first but decided only here to merge them all into one folder... One learns from mistakes. :)
+```{r}
+###############################
+# Move files and unify naming #
+###############################
+
+sample.names <- data.frame(stringsAsFactors = F)
+
+for(i in 2015:2017){
+  file.names <- dir(paste0("./Raw/",i), pattern = "*fastq.gz")
+  t <- strsplit(file.names, "_", fixed = T)
+  names <- sapply(t, "[[", 1)
+  names <- unique(names)
+  oneyear <- data.frame(SeqNames = names, Year = i, stringsAsFactors = F)
+  sample.names <- rbind(sample.names, oneyear)
+  }
+```
+
+Copy files into a unified folder to run dada2. Open terminal, cd to directory and copy files.
+```{bash, eval = FALSE}
+cd /home/user/data/Raw
+mkdir withoutPrimers
+cp -a ./2015/cutadapt/*fastq.gz ./withoutPrimers/
+cp -a ./2016/cutadapt/*fastq.gz ./withoutPrimers/
+cp -a ./2017/cutadapt/*fastq.gz ./withoutPrimers/
+
+# decompress all files
+gzip -d ./withoutPrimers/*fastq.gz
+```
+
+Next we will rename samples to unify differences of naming strategies across years. For this, I use a data frame created in excel that contains information such as whether the sample is a shallowly or deeply sequenced sample, if it is DNA or cDNA, what year etc. I will include the tedious unifying just for consistency and as a reference for others, but this will be study specific and is only necessary if you need to split the data set for DADA2.
+```{r}
+decomp.names <- dir("/home/bioinf/data/Bioinf.LaRomaine/Raw/withoutPrimers/", pattern = "*fastq")
+t <- strsplit(decomp.names, "_", fixed = T)
+names <- sapply(t, "[[", 1)
+decomp.names <- data.frame(SeqNames = unique(names), stringsAsFactors = F)
+
+# check with the first created sample name vector if all samples were indeed copied
+sample.names <- full_join(sample.names, decomp.names, by = "SeqNames")
+
+```
+
+Use external data frame as reference.
+```{r}
+# read in sequence legend
+leg <- read.csv("./Meta/seq_sample_legend.csv", sep = ",", dec = ".", stringsAsFactors = F)
+head(leg)
+tail(leg)
+```
+
+Check if names match, which ones need to be changed etc.
+```{r}
+sample.names[!sample.names$SeqNames %in% leg$SeqPlateNames,]
+leg[!leg$SeqPlateNames %in% sample.names$SeqNames,]
+# add D for DNA in 2017 in leg
+# add R for RNA in 2017 in leg
+# exchange underscore to dot for 2017 in leg
+# exchange hyphen to dot for 2016 in sample.names
+leg$RawSeqNames <- leg$SeqPlateNames
+leg$SeqPlateNames[leg$Year == 2017 & leg$DnaType == "DNA"] <- paste0(leg$SeqPlateNames[leg$Year == 2017 & leg$DnaType == "DNA"], "D")
+leg$SeqPlateNames[leg$Year == 2017 & leg$DnaType == "cDNA"] <- paste0(leg$SeqPlateNames[leg$Year == 2017 & leg$DnaType == "cDNA"], "R")
+leg$SeqPlateNames[leg$Year == 2017] <- gsub("[_]", ".", leg$SeqPlateNames[leg$Year == 2017])
+sample.names$AsDir <- sample.names$SeqNames
+sample.names$SeqNames[sample.names$Year == 2016] <- gsub("[-]", ".", sample.names$SeqNames[sample.names$Year == 2016])
+
+# do all sequence names match?
+sample.names[!sample.names$SeqNames %in% leg$SeqPlateNames,]
+
+# how many samples did we send, and how many have we retained?
+nrow(leg) - nrow(sample.names)
+
+# which samples were lost?
+leg[!leg$SeqPlateNames %in% sample.names$SeqNames,]
+# samples lost: LR108, RO2.44R, LR70R, L330CM1D, L333SD, L334SD
+# no DNA was amplified by genome quebec, all 2016 samples
+
+# duplicated sample names are a problem later in dada2, do we have some?
+duplicated(sample.names$SeqNames)
+# no
+```
+
+After we have checked whether there are no duplicated names, and all the naming is fine, we will create columns for forward and reverse reads, where we will store the path names for each sample to it's paired-reads.
+```{r}
+sample.names$Read <- "F"
+rev <- sample.names
+rev$Read <- "R"
+sample.names <- rbind(sample.names, rev)
+sample.names$SeqNames[sample.names$Read == "F"] <- paste0(sample.names$SeqNames[sample.names$Read == "F"], "_R1.fastq")
+sample.names$AsDir[sample.names$Read == "F"] <- paste0(sample.names$AsDir[sample.names$Read == "F"], "_R1.fastq")
+sample.names$SeqNames[sample.names$Read == "R"] <- paste0(sample.names$SeqNames[sample.names$Read == "R"], "_R2.fastq")
+sample.names$AsDir[sample.names$Read == "R"] <- paste0(sample.names$AsDir[sample.names$Read == "R"], "_R2.fastq")
+
+filepath <- "/home/user/data/Raw/withoutPrimers/" # change me to directory containing all files
+
+# check if it makes sense
+paste0(filepath, sample.names$AsDir[1])
+paste0(filepath, sample.names$SeqNames[1])
+```
+
+And we again, rename the files to their final sample names that are truly unique and unified across years. And save the table to split into subsets as `.csv`.
+```{r}
+################# RENAMING LOOP #################
+for(f in 1:nrow(sample.names)){
+ file.rename(paste0(filepath, sample.names$AsDir[f]), paste0(filepath, sample.names$SeqNames[f]))  
+}
+#################################################
+
+leg$splitID <- paste(leg$PlateNumber, leg$Season, leg$DnaType, sep = "_")
+
+# finally make splitID as factor
+master$num.splitID <- as.numeric(factor(master$splitID))
+
+write.table(master, "./Meta/master_seqnames_splitID.csv", sep = ",", dec = ".", row.names = F)
+```
+
+---
+
+# Quality filtering
+
+Next, we will filter the quality of reads. We split in: `PlateNumber_Season_DnaType` to also check the quality as quality differs by sequencing run.
+```{r}
+############
+# Packages #
+############
+library("dada2"); packageVersion("dada2")
+library("tidyverse")
+library("plyr")
+```
+
+To follow along the DADA2 pipeline tutorial, we will split the forward and reverse reads into separate folders. Open terminal and cd to the directory containing all files.
+```{bash, eval = FALSE}
+cd /home/user/data/Raw/withoutPrimers
+mkdir forward
+mkdir reverse
+mv  *_R1.fastq ./forward
+mv  *_R2.fastq ./reverse
+```
+
+Create paths to the files.
+
+```{r}
+pathF <- "/home/bioinf/data/Bioinf.LaRomaine/Raw/withoutPrimers/forward" # CHANGE ME to the directory containing your demultiplexed forward-read fastqs
+pathR <- "/home/bioinf/data/Bioinf.LaRomaine/Raw/withoutPrimers/reverse" # CHANGE ME ...
+filtpathF <- file.path(pathF, "filtered") # Filtered forward files go into the pathF/filtered/ subdirectory
+filtpathR <- file.path(pathR, "filtered")
+
+# create a vector with existing samples
+sort.files <- function(x, pattern){
+  sort(list.files(x, pattern = pattern, full.names = TRUE))
+}
+
+fnFs <- lapply(pathF, sort.files, pattern = "_R1.fastq")
+baseFs <- unlist(sapply(fnFs, basename))
+sample.names <- sapply(sapply(baseFs, strsplit, split = "_"), "[[", 1)
+```
+
+Read in master file created in the earlier step.
+```{r}
+# read in master file for splitting by ID
+splitdf <- read.csv("./Meta/master_seqnames_splitID.csv", sep = ",", dec = ".", stringsAsFactors = F)
+```
+
+Add paths to data frame.
+```{r}
+splitdf$pathFs <- file.path(pathF, paste0(splitdf$DadaNames, "_R1.fastq"))
+splitdf$pathRs <- file.path(pathR, paste0(splitdf$DadaNames, "_R2.fastq"))
+splitdf$filtpathFs <- file.path(pathF, "filtered", paste0(splitdf$DadaNames, "_R1.fastq.gz"))
+splitdf$filtpathRs <- file.path(pathR, "filtered", paste0(splitdf$DadaNames, "_R2.fastq.gz"))
+```
+
+Pick a single sample for each splitID to determine where to cut the reads due to dropping quality
+
+```{r}
+pickRandomRows <- function(df, numberOfRows = 1){
+  df %>% slice(runif(numberOfRows, 0,  length(df[,1])))
+}
+```
+
+Pick a random sample for each splitID
+```{r}
+qualcheck <- splitdf %>% group_by(splitID) %>% slice(c(1))
+# qualityPlot
+plyr::d_ply(qualcheck[,c("pathFs","pathRs")], .(qualcheck$splitID), .fun = plotQualityProfile,
+                  .print = TRUE)
+```
+
+
+## Prepare for filtering
+Add Trimming information, decided based on quality plots c(FWD, REV)
+
+```{r}
+trim <- data.frame(splitID = sort(unique(splitdf$splitID)),
+                   TrimF = c(210,225,225,225,225,
+                             225,225,225,225,210,
+                             210,210,225,225,190,
+                             210,225,220,225,225,
+                             225,225),
+                   TrimR = c(180,180,225,225,225,
+                             225,225,225,225,150,
+                             150,150,225,225,225,
+                             220,225,225,225,225,
+                             225,225), stringsAsFactors = F)
+splitdf <- left_join(splitdf, trim, by = "splitID")
+saveRDS(splitdf, "./Objects/splitdf.rds")
+```
+
+Separate data frame content into lists.
+```{r}
+pathFs <- list(splitdf$pathFs)
+pathRs <- list(splitdf$pathRs)
+filtpathFs <- list(splitdf$filtpathFs)
+filtpathRs <- list(splitdf$filtpathRs)
+trimF <- splitdf$TrimF
+trimR <- splitdf$TrimR
+```
+
+## Filter
+
+Filter and keep only bases with high enough quality in a looping fashion.
+
+```{r}
+for(i in 1:nrow(splitdf)){
+  filterAndTrim(fwd = splitdf$pathFs[i], filt = splitdf$filtpathFs[i], rev = splitdf$pathRs[i],
+                filt.rev = splitdf$filtpathRs[i], truncLen = c(splitdf$TrimF[i],splitdf$TrimR[i]),
+                maxEE = 2, truncQ = 2, maxN = 0, rm.phix=TRUE, compress=TRUE, verbose=TRUE,
+                multithread=TRUE)
+}
+```
+
+
+# Learn error rates, infer sequence variants and merge paired-ends
+
+```{r}
+############
+# Packages #
+############
+library("dada2"); packageVersion("dada2")
+library("tidyverse")
+library("plyr")
+```
+
+
+Some pre-processing. Read-in `splitdf.rds` created in earlier for pooling.
+
+```{r}
+splitdf <- readRDS("./Objects/splitdf.rds")
+```
+
+Extract only sample names.
+```{r}
+baseFs <- unlist(sapply(splitdf$filtpathFs, basename))
+sample.names <- sapply(sapply(baseFs, strsplit, split = "_"), "[[", 1)
+```
+
+Splits the paths into separate lists, where each bin represents a `splitID` that contains again a list. In this list, each element is a vector containing the file path to each sample.
+```{r}
+Fs <- daply(splitdf[,c("num.splitID","filtpathFs")], .(num.splitID), .fun = list)
+Fs <- sapply(Fs, "[[", 2)
+
+Rs <- daply(splitdf[,c("num.splitID","filtpathRs")], .(num.splitID), .fun = list)
+Rs <- sapply(Rs, "[[", 2)
+
+#Example:
+unique(splitdf$splitID[splitdf$num.splitID == 3])
+Fs[3]
+Rs[3]
+```
+
+We will run through the whole process with a loop, where each intermediate product is saved as a R object in the local directory in case memory failure or any other failure interrupts the process. Error rate plots are also saved with the splitID identifier. We have set `MAX_CONSIST = 20` as for some samples convergence was not reached with the default parameter. `nbases = 1e8` is set as advised in the big data tutorial. Pooling is run as 'pseudo'-pooling, where an ASV table is first created by a sample-by-sample fashion and subsequently, `dada()` runs again with the initial ASV table as reference. This helps to retain singletons by sample, and instead looses only singletons by pool.
+```{r}
+for(i in 1:length(Fs)){
+  
+  sample.names <- sapply(strsplit(basename(Fs[[i]]),"_"),`[`,1)
+  sample.namesR <- sapply(strsplit(basename(Rs[[i]]),"_"),`[`,1)
+  if(!identical(sample.names, sample.namesR)) stop("Forward and reverse files do not match.")
+  names(Fs[[i]]) <- sample.names
+  names(Rs[[i]]) <- sample.namesR
+  
+  set.seed(100)
+  
+  # Learn forward error rates, save error plot and as R object
+  errF <- learnErrors(Fs[[i]], nbases=1e8, multithread=TRUE, MAX_CONSIST = 20)
+  saveRDS(errF, file = paste0("./Objects/",i,"_errF.rds"))
+  ggsave(paste0("./Figures/",i,"_errF.png"), plot = plotErrors(errF, nominalQ = TRUE),
+         units = "cm", width = 40, height = 40)
+  # Learn reverse error rates, save error plot and as R object
+  errR <- learnErrors(Rs[[i]], nbases=1e8, multithread=TRUE, MAX_CONSIST = 20)
+  ggsave(paste0("./Figures/",i,"_errR.png"), plot = plotErrors(errR, nominalQ = TRUE),
+         units = "cm", width = 40, height = 40)
+  saveRDS(errR, file = paste0("./Objects/",i,"_errR.rds"))
+  
+  # Dereplicate
+  # Name the derep-class objects by the sample names
+  derepFs <- derepFastq(Fs[[i]], verbose=TRUE)
+  names(derepFs) <- sample.names
+  saveRDS(derepFs, file = paste0("./Objects/",i,"_derepFs.rds"))
+  
+  derepRs <- derepFastq(Rs[[i]], verbose=TRUE)
+  names(derepRs) <- sample.namesR
+  saveRDS(derepRs, file = paste0("./Objects/",i,"_derepRs.rds"))
+
+  # run dada on pooled samples
+  poolFs <- dada(derepFs, err=errF, pool='pseudo', multithread = TRUE)
+  saveRDS(poolFs, file = paste0("./Objects/",i,"_poolFs.rds"))
+  
+  poolRs <- dada(derepRs, err=errR, pool='pseudo', multithread = TRUE)
+  saveRDS(poolRs, file = paste0("./Objects/",i,"_poolRs.rds"))
+  # merge paired-end reads
+  mergers <- mergePairs(poolFs, derepFs, poolRs, derepRs)
+  saveRDS(mergers, file = paste0("./Objects/",i,"_mergers.rds"))
+  
+  seqtab <- makeSequenceTable(mergers)
+  saveRDS(seqtab, file = paste0("./Objects/",i,"_seqtab.rds"))
+}
+```
+
+
+---
+
+# Merge runs and collapse to 100% 'OTU'
+
+```{r}
+############
+# Packages #
+############
+library("dada2")
+```
+
+## Merge multiple runs
+```{r}
+# Merge multiple runs, we have 21 categories of Plate_Year_Season
+merger <- list()
+for(i in 1:21){
+merger[[i]] <- readRDS(paste0("./Objects/",i,"_seqtab.rds"))
+}
+
+
+st.all <- mergeSequenceTables(merger[[1]],merger[[2]],merger[[3]],merger[[4]],merger[[5]],merger[[6]],merger[[7]],merger[[8]],merger[[9]],merger[[10]],merger[[11]],merger[[12]],merger[[13]],merger[[14]],merger[[15]],merger[[16]],merger[[17]],merger[[18]],merger[[19]],merger[[20]],merger[[21]])
+saveRDS(st.all, "./Objects/all_seqtab.rds")
+```
+
+## Collapse ASVs differing only by length
+As we are dealing with DNA and cDNA data, ASVs are too fine to be able to find matches. Thus, we will cluster to 100% 'OTUs' where sequences only vary by length but are essentially identical.
+```{r}
+# collapse ASVs with identical sequence
+col.st <- collapseNoMismatch(st.all, minOverlap = 20, verbose = T)
+saveRDS(col.st, "./Objects/collapsed_seqtab.rds")
+# took 4 days
+```
+## Remove Chimeras
+```{r}
+seqtab.nochim <- removeBimeraDenovo(col.st, method="consensus", multithread=TRUE, verbose = T)
+saveRDS(seqtab.nochim, "./Objects/prelim_nochim_seqtab.rds")
+```
+## Assign taxonomy until species level
+```{r}
+library(DECIPHER); packageVersion("DECIPHER")
+
+# assign taxonomy
+tax <- assignTaxonomy(seqtab.nochim, "./DB/silva_nr_v128_train_set.fa.gz", multithread = TRUE)
+saveRDS(tax, "./Objects/prelim_taxtab.rds")
+
+# assign species
+dna <- DNAStringSet(getSequences(seqtab.nochim)) # Create a DNAStringSet from the ASVs
+load("./DB/SILVA_SSU_r132_March2018.RData") # CHANGE TO THE PATH OF YOUR TRAINING SET
+ids <- IdTaxa(dna, trainingSet, strand="top", processors=NULL, verbose=FALSE) # use all processors
+ranks <- c("domain", "phylum", "class", "order", "family", "genus", "species") # ranks of interest
+# Convert the output object of class "Taxa" to a matrix analogous to the output from assignTaxonomy
+taxid <- t(sapply(ids, function(x) {
+        m <- match(ranks, x$rank)
+        taxa <- x$taxon[m]
+        taxa[startsWith(taxa, "unclassified_")] <- NA
+        taxa
+}))
+
+colnames(taxid) <- ranks; rownames(taxid) <- getSequences(seqtab.nochim)
+saveRDS(tax, "./Objects/prelim_taxtabspecies.rds")
+```
+
+Essentially we are done with the pipeline. We will finally check how many reads we loose along the pipeline to see whether we need to change something.
+
+# Track reads
+
+To track the reads, best is to save something in-between each step. As I forgot to do this at the beginning of the pipeline, we will extract the number of reads per sample from the fastq files.
+```{r}
+############
+# Packages #
+############
+library("dada2")
+library("ShortRead"); packageVersion("ShortRead")
+library("data.table")
+library("plyr")
+
+# raw number of reads
+path <- list("/home/user/data/Raw/2015/",
+             "/home/user/data/Raw/2016/",
+             "/home/user/data/Raw/2017/") ## CHANGE ME to the directory containing the fastq files.
+path.list <- lapply(path, list.files, pattern = "*fastq.gz")
+path.list <- mapply(paste0, path, path.list)
+path.list <- unlist(path.list)
+
+qa.sum <- qa(path.list, type = "fastq")
+raw <- data.frame(samples = gsub(".fastq.gz", "", rownames(qa.sum[["readCounts"]])),
+                  qa.sum[["readCounts"]][1],
+                  row.names = NULL, stringsAsFactors = F)
+colnames(raw)[2] <- "input"
+raw$samples <- sapply(strsplit(raw$samples, "_"), "[[",1)
+raw <- raw[duplicated(raw$samples),]
+saveRDS(raw, "./Objects/raw_trackreads.rds")
+
+# number of reads after cutadapt
+path <- list("/home/user/data/Raw/2015/cutadapt/",
+             "/home/user/data/Raw/2016/cutadapt/",
+             "/home/user/data/Raw/2017/cutadapt/")
+## CHANGE ME to the directory containing the fastq files.
+path.list <- lapply(path, list.files, pattern = "*fastq.gz")
+path.list <- mapply(paste0, path, path.list)
+path.list <- unlist(path.list)
+
+qa.sum <- qa(path.list, type = "fastq")
+cutadapt <- data.frame(samples = gsub(".fastq.gz", "", rownames(qa.sum[["readCounts"]])),
+                       qa.sum[["readCounts"]][1],
+                       row.names = NULL, stringsAsFactors = F)
+colnames(cutadapt)[2] <- "cutadapt"
+cutadapt$samples <- sapply(strsplit(cutadapt$samples, "_"), "[[",1)
+cutadapt <- cutadapt[duplicated(cutadapt$samples),]
+saveRDS(cutadapt,"./Objects/cutadapt_trackreads.rds")
+
+# number of reads retained after filterAndTrim()
+path <- list("/home/user/data/Raw/withoutPrimers/forward/filtered/",
+             "/home/user/data/Raw/withoutPrimers/reverse/filtered/") ## CHANGE ME to the directory containing the fastq files.
+path.list <- lapply(path, list.files, pattern = "*fastq.gz")
+path.list <- mapply(paste0, path, path.list, SIMPLIFY = FALSE)
+path.list <- unlist(path.list)
+
+qa.sum <- qa(path.list, type = "fastq")
+filtered <- data.frame(samples = gsub(".fastq.gz", "", rownames(qa.sum[["readCounts"]])),
+                       qa.sum[["readCounts"]][1],
+                       row.names = NULL, stringsAsFactors = F)
+colnames(filtered)[2] <- "filt"
+filtered$samples <- sapply(strsplit(filtered$samples, "_"), "[[",1)
+filtered <- filtered[duplicated(filtered$samples),]
+saveRDS(filtered, "./Objects/filtered_trackreads.rds")
+
+# number of reads retained after dadaF()
+getN <- function(x) sum(getUniques(x))
+dadaFs <- data.frame()
+for(i in 1:21){
+  pseudo <- readRDS(paste0("./Objects/",i,"_pseudopoolFs.rds"))
+  dadaFs <- rbind(dadaFs,data.frame(samples = names(sapply(pseudo, getN)),
+                                    dadaF = sapply(pseudo, getN),
+                                    row.names = NULL, stringsAsFactors = F))
+}
+saveRDS(dadaFs, "./Objects/dadaF_trackreads.rds")
+
+# number of reads retained after dadaR()
+dadaRs <- data.frame()
+for(i in 1:21){
+  pseudo <- readRDS(paste0("./Objects/",i,"_pseudopoolRs.rds"))
+  dadaRs <- rbind(dadaRs,data.frame(samples = names(sapply(pseudo, getN)),
+                                    dadaR = sapply(pseudo, getN),
+                                    row.names = NULL, stringsAsFactors = F))
+}
+saveRDS(dadaRs,"./Objects/dadaR_trackreads.rds")
+
+# number of reads retained after merging
+mergers <- data.frame()
+for(i in 1:21){
+  mer <- readRDS(paste0("./Objects/",i,"_mergers.rds"))
+  mergers <- rbind(mergers,data.frame(samples = names(sapply(mer, getN)),
+                                      merged = sapply(mer, getN),
+                                      row.names = NULL, stringsAsFactors = F))
+}
+saveRDS(mergers,"./Objects/merged_trackreads.rds")
+
+# number of reads retained after chimera removal
+nochim <- data.frame(samples = rownames(readRDS("./Objects/prelim_nochim_seqtab.rds")),
+                     noChim =rowSums(readRDS("./Objects/prelim_nochim_seqtab.rds")),
+                     stringsAsFactors = F)
+
+track <- join_all(list(raw, cutadapt, filtered, dadaFs, dadaRs, mergers, nochim), by = 'samples', type = 'full')
+track$perc_retain <- track$noChim * 100 / track$input
+write.table(track,"./Objects/final_trackreads.csv", row.names = FALSE, sep = ",", dec = ".")
+```
+
+Here is a subset of the output:
+```{r}
+track[201:205,]
+```
+
