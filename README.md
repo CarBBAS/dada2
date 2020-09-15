@@ -9,7 +9,7 @@ We start by renaming sample file names, to simplify the names returned by our se
 After quality checking, the samples are run through the `dada` step on a plate basis with 'pseudo-pooling' enabled to ensure the retention of singleton reads within samples. Pooling only removes singletons within sampling campaigns. We cluster our amplicon sequence variants (ASVs) into 100% OTUs with `collapseNoMismatch`, as we are dealing with both DNA and RNA. The level of resolution of ASVs are believed to be too high to be able to match potential DNA and RNA reads of the same organism.
 
 The original workflow was designed for samples that were split in several folders by years (e.g. 2015, 2016, 2017) and thus makes use of list frequently.
-If your dataset's samples are all in one folder, please make use of the `single-folder version` that is provided for almost every step. They are not being evaluated by default, thus remove the `#` infront of the relevant lines.
+If your dataset's samples are all in one folder, please make use of the `single-directory version` that is provided for almost every step. They are not being evaluated by default, thus remove the `#` infront of the relevant lines.
 
 ---
 
